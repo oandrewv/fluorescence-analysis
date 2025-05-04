@@ -12,10 +12,11 @@ class FluorescenceAnalyzer:
         # Калибровочная кривая: известные концентрации и соответствующие интенсивности
         self.calibration_curve = None
         self.model = None
-        self.roi_coords = None  # Координаты области интереса (ROI)
+        self.calibration_roi_coords = None  # Координаты области интереса (ROI) для калибровочных изображений
+        self.sample_roi_coords = {}  # Словарь координат ROI для образцов (ключ - имя файла)
         self.r2 = None  # Коэффициент детерминации
         
-    def select_roi(self, image_path):
+    def select_roi(self, image_path, title="Выберите область интереса (ROI)"):
         """Позволяет пользователю выбрать область интереса на изображении."""
         image = cv2.imread(image_path)
         if image is None:
@@ -27,7 +28,7 @@ class FluorescenceAnalyzer:
         # Показать изображение и выбрать ROI
         plt.figure(figsize=(10, 8))
         plt.imshow(image_rgb)
-        plt.title("Кликните на 4 точки, чтобы выбрать область интереса (тест-полоску)")
+        plt.title(f"{title} - Кликните на 4 точки, чтобы выбрать область интереса (тест-полоску)")
         plt.axis('on')
         
         coords = plt.ginput(4, timeout=0)
@@ -36,32 +37,51 @@ class FluorescenceAnalyzer:
         if len(coords) != 4:
             raise ValueError("Необходимо выбрать ровно 4 точки")
         
-        self.roi_coords = np.array(coords, dtype=np.int32)
-        return self.roi_coords
+        return np.array(coords, dtype=np.int32)
     
-    def preprocess_image(self, image_path):
-        """Предобработка изображения и извлечение ROI."""
+    def preprocess_image(self, image_path, is_sample=False):
+        """Предобработка изображения и извлечение ROI.
+        
+        Args:
+            image_path: Путь к изображению
+            is_sample: Флаг, указывающий, является ли изображение образцом
+        """
         image = cv2.imread(image_path)
         if image is None:
             raise ValueError(f"Не удалось загрузить изображение: {image_path}")
         
+        # Определяем, какие координаты ROI использовать
+        roi_coords = None
+        if is_sample:
+            # Для образца
+            img_name = os.path.basename(image_path)
+            if img_name in self.sample_roi_coords:
+                roi_coords = self.sample_roi_coords[img_name]
+            else:
+                # Если ROI для этого образца еще не выбран, вернем все изображение
+                print(f"ROI для образца {img_name} не выбран, используем все изображение")
+                return image
+        else:
+            # Для калибровочного изображения
+            roi_coords = self.calibration_roi_coords
+            
         # Если ROI не выбран, используем все изображение
-        if self.roi_coords is None:
+        if roi_coords is None:
             print("ROI не выбран, используем все изображение")
             return image
         
         # Создание маски ROI
         mask = np.zeros_like(image[:, :, 0])
-        cv2.fillPoly(mask, [self.roi_coords], 255)
+        cv2.fillPoly(mask, [roi_coords], 255)
         
         # Применение маски
         masked_image = cv2.bitwise_and(image, image, mask=mask)
         
         return masked_image
     
-    def extract_fluorescence_intensity(self, image_path):
+    def extract_fluorescence_intensity(self, image_path, is_sample=False):
         """Извлечение интенсивности флуоресценции из изображения."""
-        processed_image = self.preprocess_image(image_path)
+        processed_image = self.preprocess_image(image_path, is_sample)
         
         # Преобразование в HSV для лучшего анализа
         hsv_image = cv2.cvtColor(processed_image, cv2.COLOR_BGR2HSV)
@@ -137,7 +157,7 @@ class FluorescenceAnalyzer:
         
         intensities = []
         for image_path in calibration_images:
-            intensity = self.extract_fluorescence_intensity(image_path)
+            intensity = self.extract_fluorescence_intensity(image_path, is_sample=False)
             intensities.append(intensity)
         
         # Логарифмирование концентраций по основанию 10
@@ -171,12 +191,12 @@ class FluorescenceAnalyzer:
         
         return self.r2
     
-    def predict_concentration(self, image_path):
+    def predict_concentration(self, image_path, is_sample=True):
         """Предсказание концентрации аналита по изображению."""
         if self.model is None:
             raise ValueError("Сначала необходимо построить калибровочную кривую")
         
-        intensity = self.extract_fluorescence_intensity(image_path)
+        intensity = self.extract_fluorescence_intensity(image_path, is_sample)
         
         # Обратное преобразование интенсивности в log_concentration
         # Используем обратную формулу: log_conc = (intensity - intercept) / slope
@@ -188,7 +208,7 @@ class FluorescenceAnalyzer:
         # Обратное логарифмирование для получения концентрации
         concentration = 10 ** log_concentration
         
-        return concentration
+        return concentration, intensity
     
     def visualize_calibration_curve(self, save_path=None):
         """Визуализация линейной калибровочной кривой в координатах 'интенсивность от log10(концентрация)'."""
@@ -239,9 +259,11 @@ class FluorescenceAnalyzer:
     
     def analyze_sample_image(self, image_path, show_visualization=True, save_visualization=None):
         """Полный анализ изображения образца с визуализацией."""
-        processed_image = self.preprocess_image(image_path)
-        intensity = self.extract_fluorescence_intensity(image_path)
-        concentration = self.predict_concentration(image_path)
+        # Проверяем, есть ли у этого образца сохраненные координаты ROI
+        img_name = os.path.basename(image_path)
+        
+        # Получаем интенсивность и концентрацию
+        concentration, intensity = self.predict_concentration(image_path, is_sample=True)
         
         # Вычисляем log10 концентрации для отображения на графике
         log_concentration = math.log10(concentration) if concentration > 0 else float('-inf')
@@ -259,6 +281,7 @@ class FluorescenceAnalyzer:
             
             # Показываем обработанное изображение с ROI
             plt.subplot(2, 2, 2)
+            processed_image = self.preprocess_image(image_path, is_sample=True)
             processed_rgb = cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB)
             plt.imshow(processed_rgb)
             plt.title('Область интереса (ROI)')
@@ -325,6 +348,17 @@ class FluorescenceAnalyzer:
             'log_concentration': log_concentration
         }
 
+    def select_roi_for_sample(self, image_path):
+        """Выбор области интереса для конкретного образца."""
+        img_name = os.path.basename(image_path)
+        title = f"Образец: {img_name}"
+        
+        roi_coords = self.select_roi(image_path, title)
+        self.sample_roi_coords[img_name] = roi_coords
+        
+        print(f"ROI для образца {img_name} установлен")
+        return roi_coords
+
     def save_calibration(self, filepath):
         """Сохраняет данные калибровки в файл."""
         if self.calibration_curve is None or self.model is None:
@@ -336,7 +370,9 @@ class FluorescenceAnalyzer:
             'r2': self.r2,
             'concentrations': self.calibration_curve['concentrations'],
             'log_concentrations': self.calibration_curve['log_concentrations'],
-            'intensities': self.calibration_curve['intensities']
+            'intensities': self.calibration_curve['intensities'],
+            'calibration_roi_coords': self.calibration_roi_coords,
+            'sample_roi_coords': self.sample_roi_coords
         }
         
         np.save(filepath, calibration_data)
@@ -356,6 +392,10 @@ class FluorescenceAnalyzer:
                 'log_concentrations': calibration_data['log_concentrations'],
                 'intensities': calibration_data['intensities']
             }
+            
+            # Загружаем координаты ROI
+            self.calibration_roi_coords = calibration_data.get('calibration_roi_coords')
+            self.sample_roi_coords = calibration_data.get('sample_roi_coords', {})
             
             # Воссоздаем модель
             X = np.array(self.calibration_curve['log_concentrations']).reshape(-1, 1)
@@ -434,9 +474,12 @@ def main():
         print(f"Найдено {len(calibration_images)} калибровочных изображений.")
         print("Концентрации будут извлечены из имен файлов.")
         
-        # Выбор области интереса (ROI) на первом калибровочном изображении
+        # Выбор области интереса (ROI) на первом калибровочном изображении для всех калибровочных изображений
         print("Выберите область интереса (ROI) на калибровочном изображении...")
-        analyzer.select_roi(calibration_images[0])
+        analyzer.calibration_roi_coords = analyzer.select_roi(
+            calibration_images[0], 
+            "Калибровочное изображение"
+        )
         
         # Построение калибровочной кривой (концентрации извлекаются из имен файлов)
         try:
@@ -468,9 +511,37 @@ def main():
     print(f"\nНайдено {len(sample_images)} образцов для анализа.")
     results = {}
     
+    # Спрашиваем, хочет ли пользователь выбрать ROI для каждого образца
+    select_individual_roi = input("Хотите выбрать область интереса (ROI) для каждого образца? (y/n): ").lower() == 'y'
+    
+    # Если пользователь отказался от индивидуальных ROI, спрашиваем про общий ROI для всех образцов
+    use_common_sample_roi = False
+    if not select_individual_roi:
+        use_common_sample_roi = input("Использовать общую область интереса для всех образцов? (y/n): ").lower() == 'y'
+        
+        if use_common_sample_roi:
+            # Выбираем ROI на первом образце для всех образцов
+            print("Выберите область интереса (ROI) на первом образце для всех образцов...")
+            common_roi = analyzer.select_roi(sample_images[0], "Общий ROI для образцов")
+            
+            # Применяем этот ROI ко всем образцам
+            for img_path in sample_images:
+                img_name = os.path.basename(img_path)
+                analyzer.sample_roi_coords[img_name] = common_roi
+            
+            print("Общий ROI для образцов установлен")
+    
+    # Анализируем каждый образец
     for img_path in sample_images:
         img_name = os.path.basename(img_path)
         print(f"\nАнализ образца: {img_name}")
+        
+        # Если нужны индивидуальные ROI для каждого образца
+        if select_individual_roi:
+            # Проверяем, был ли уже выбран ROI для этого образца
+            if img_name not in analyzer.sample_roi_coords:
+                print(f"Выберите область интереса (ROI) для образца {img_name}...")
+                analyzer.select_roi_for_sample(img_path)
         
         # Путь для сохранения визуализации анализа
         sample_result_path = os.path.join(results_dir, f"analysis_{os.path.splitext(img_name)[0]}.png")
@@ -480,19 +551,23 @@ def main():
         print(f"Концентрация аналита: {result['concentration']:.4e}")
         print(f"log₁₀(Концентрация): {result['log_concentration']:.4f}")
     
+    # Сохраняем калибровочные данные с ROI для образцов
+    analyzer.save_calibration(calibration_data_path)
+    
     # Вывод итоговых результатов
     print("\n--- Итоговые результаты ---")
     for img_name, result in results.items():
         print(f"{img_name}: концентрация = {result['concentration']:.4e}, log₁₀(конц.) = {result['log_concentration']:.4f}")
     
     # Сохранение итоговых результатов в текстовый файл
+    # When opening the file for writing, specify UTF-8 encoding
     result_file_path = os.path.join(results_dir, "analysis_results.txt")
-    with open(result_file_path, 'w') as f:
+    with open(result_file_path, 'w', encoding='utf-8') as f:  # Add encoding='utf-8' here
         f.write(f"Параметры калибровки: наклон = {analyzer.slope:.4f}, пересечение = {analyzer.intercept:.4f}, R² = {analyzer.r2:.4f}\n\n")
         f.write("--- Результаты анализа ---\n")
         for img_name, result in results.items():
             f.write(f"{img_name}: концентрация = {result['concentration']:.4e}, log₁₀(конц.) = {result['log_concentration']:.4f}\n")
-    
+        
     print(f"\nРезультаты анализа сохранены в {result_file_path}")
     print(f"Графические результаты сохранены в папке {results_dir}")
 
